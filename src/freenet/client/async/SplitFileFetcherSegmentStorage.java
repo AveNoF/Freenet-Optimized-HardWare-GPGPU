@@ -10,6 +10,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ForkJoinPool;
+import java.util.function.IntConsumer;
+import java.util.stream.IntStream;
 
 import freenet.client.FetchException;
 import freenet.client.FetchException.FetchExceptionMode;
@@ -43,6 +47,49 @@ public class SplitFileFetcherSegmentStorage {
     // the blocks in, whether binary blobs are enabled etc ... and this has caught nasty bugs in
     // the past, although now we have hashes at file level ...
     private static final boolean FORCE_CHECK_FEC_KEYS = true;
+
+    /** Number of worker threads used to encode/verify splitfile blocks (AES-CTR + SHA-256) in
+     * parallel. Each segment decode has to re-encode every fetched block and every regenerated
+     * block to verify its key; this is pure CPU work and embarrassingly parallel. Defaults to the
+     * number of available processors, override with -Dfreenet.client.fec.encodeThreads=N (1 = off). */
+    private static final int FEC_ENCODE_THREADS =
+        Math.max(1, Integer.getInteger("freenet.client.fec.encodeThreads",
+                Runtime.getRuntime().availableProcessors()));
+
+    /** Dedicated pool so we don't starve (or get starved by) the common ForkJoinPool. Null if
+     * parallel encoding is disabled. */
+    private static final ForkJoinPool ENCODE_POOL =
+        FEC_ENCODE_THREADS > 1 ? new ForkJoinPool(FEC_ENCODE_THREADS) : null;
+
+    /** Run {@code body} for indices 0..n-1, in parallel when possible. The body MUST only write to
+     * its own index of any shared array (no other shared mutable state), so that the parallel and
+     * serial executions are equivalent. Exceptions thrown by the body are propagated to the caller
+     * exactly as in the serial case. */
+    private static void parallelFor(int n, IntConsumer body) {
+        if(ENCODE_POOL == null || n <= 1) {
+            for(int i=0;i<n;i++) body.accept(i);
+            return;
+        }
+        try {
+            ENCODE_POOL.submit(() -> IntStream.range(0, n).parallel().forEach(body)).get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            // Fall back to serial so we still produce a correct result.
+            for(int i=0;i<n;i++) body.accept(i);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if(cause instanceof RuntimeException) throw (RuntimeException) cause;
+            if(cause instanceof Error) throw (Error) cause;
+            throw new RuntimeException(cause);
+        }
+    }
+
+    /** Result of encoding one splitfile block off-thread for key verification. */
+    private static final class EncodeResult {
+        ClientCHK decodeKey;
+        ClientCHKBlock block;
+        CHKEncodeException error;
+    }
 
     /** The segment number within the splitfile */
     final int segNo;
@@ -414,16 +461,41 @@ public class SplitFileFetcherSegmentStorage {
         int validDataBlocks = 0;
         byte[][] dataBlocks = new byte[blocksForDecode()][];
         byte[][] checkBlocks = new byte[this.checkBlocks][];
-        
-        for(SplitFileFetcherBlock test : maybeBlocks) {
+
+        // Re-encode every candidate block in parallel to verify its key. This is the bulk of the
+        // CPU cost of a decode (AES-CTR + SHA-256 per 32KB block) and has no shared mutable state,
+        // so we precompute the encodings off-thread and then run the original decision logic
+        // serially using the precomputed results.
+        final SplitFileSegmentKeys fkeys = keys;
+        final List<SplitFileFetcherBlock> candidateBlocks = maybeBlocks;
+        final EncodeResult[] encoded = new EncodeResult[candidateBlocks.size()];
+        parallelFor(encoded.length, idx -> {
+            SplitFileFetcherBlock t = candidateBlocks.get(idx);
+            EncodeResult r = new EncodeResult();
+            encoded[idx] = r;
+            if(t.blockNumber == -1) return; // Handled (and faithfully reproduced) in serial loop.
+            r.decodeKey = fkeys.getKey(t.blockNumber, null, false);
+            try {
+                r.block = ClientCHKBlock.encodeSplitfileBlock(t.buf,
+                        r.decodeKey.getCryptoKey(), r.decodeKey.getCryptoAlgorithm());
+            } catch (CHKEncodeException e) {
+                r.error = e;
+            }
+        });
+
+        for(int idx=0; idx<encoded.length; idx++) {
+            SplitFileFetcherBlock test = candidateBlocks.get(idx);
+            EncodeResult precomputed = encoded[idx];
             boolean failed = false;
             int blockNumber = test.blockNumber;
             byte[] buf = test.buf;
-            ClientCHK decodeKey = blockNumber == -1 ? null : keys.getKey(blockNumber, null, false);
+            ClientCHK decodeKey = blockNumber == -1 ? null : precomputed.decodeKey;
             // Encode it to check whether the key is the same.
             try {
-                ClientCHKBlock block =
-                    ClientCHKBlock.encodeSplitfileBlock(buf, decodeKey.getCryptoKey(), decodeKey.getCryptoAlgorithm());
+                ClientCHKBlock block = blockNumber == -1 ?
+                    ClientCHKBlock.encodeSplitfileBlock(buf, decodeKey.getCryptoKey(), decodeKey.getCryptoAlgorithm()) :
+                    precomputed.block;
+                if(precomputed.error != null) throw precomputed.error;
                 ClientCHK actualKey = block.getClientKey();
                 if(decodeKey == null || !decodeKey.equals(actualKey)) {
                     // Is it a different block?
@@ -537,13 +609,33 @@ public class SplitFileFetcherSegmentStorage {
 
     private void checkDecodedDataBlocks(byte[][] dataBlocks, boolean[] dataBlocksPresent, 
             SplitFileSegmentKeys keys, boolean capturingBinaryBlob) {
+        // Encode the freshly decoded data blocks in parallel (CPU-bound, no shared state), then
+        // apply the verification logic serially in order to preserve early-exit semantics.
+        final SplitFileSegmentKeys fkeys = keys;
+        final byte[][] fdataBlocks = dataBlocks;
+        final boolean[] fpresent = dataBlocksPresent;
+        final EncodeResult[] enc = new EncodeResult[dataBlocks.length];
+        parallelFor(dataBlocks.length, i -> {
+            if(fpresent[i]) return;
+            EncodeResult r = new EncodeResult();
+            enc[i] = r;
+            r.decodeKey = fkeys.getKey(i, null, false);
+            try {
+                r.block = ClientCHKBlock.encodeSplitfileBlock(fdataBlocks[i],
+                        r.decodeKey.getCryptoKey(), r.decodeKey.getCryptoAlgorithm());
+            } catch (CHKEncodeException e) {
+                r.error = e;
+            }
+        });
         for(int i=0;i<dataBlocks.length;i++) {
             if(dataBlocksPresent[i]) continue;
-            ClientCHK decodeKey = keys.getKey(i, null, false);
+            EncodeResult r = enc[i];
+            ClientCHK decodeKey = r.decodeKey;
             // Encode it to check whether the key is the same.
             ClientCHKBlock block;
             try {
-                block = ClientCHKBlock.encodeSplitfileBlock(dataBlocks[i], decodeKey.getCryptoKey(), decodeKey.getCryptoAlgorithm());
+                if(r.error != null) throw r.error;
+                block = r.block;
                 ClientCHK actualKey = block.getClientKey();
                 if(!actualKey.equals(decodeKey)) {
                     if(i == dataBlocks.length-1 && this.segNo == parent.segments.length-1 && 
@@ -569,13 +661,34 @@ public class SplitFileFetcherSegmentStorage {
 
     private boolean checkEncodedDataBlocks(byte[][] checkBlocks, boolean[] checkBlocksPresent, 
             SplitFileSegmentKeys keys, boolean capturingBinaryBlob) {
+        // Encode the regenerated check blocks in parallel (CPU-bound, no shared state), then apply
+        // the verification logic serially in order to preserve early-exit semantics.
+        final SplitFileSegmentKeys fkeys = keys;
+        final byte[][] fcheckBlocks = checkBlocks;
+        final boolean[] fpresent = checkBlocksPresent;
+        final int base = blocksForDecode();
+        final EncodeResult[] enc = new EncodeResult[checkBlocks.length];
+        parallelFor(checkBlocks.length, i -> {
+            if(fpresent[i]) return;
+            EncodeResult r = new EncodeResult();
+            enc[i] = r;
+            r.decodeKey = fkeys.getKey(i+base, null, false);
+            try {
+                r.block = ClientCHKBlock.encodeSplitfileBlock(fcheckBlocks[i],
+                        r.decodeKey.getCryptoKey(), r.decodeKey.getCryptoAlgorithm());
+            } catch (CHKEncodeException e) {
+                r.error = e;
+            }
+        });
         for(int i=0;i<checkBlocks.length;i++) {
             if(checkBlocksPresent[i]) continue;
-            ClientCHK decodeKey = keys.getKey(i+blocksForDecode(), null, false);
+            EncodeResult r = enc[i];
+            ClientCHK decodeKey = r.decodeKey;
             // Encode it to check whether the key is the same.
             ClientCHKBlock block;
             try {
-                block = ClientCHKBlock.encodeSplitfileBlock(checkBlocks[i], decodeKey.getCryptoKey(), decodeKey.getCryptoAlgorithm());
+                if(r.error != null) throw r.error;
+                block = r.block;
                 ClientCHK actualKey = block.getClientKey();
                 if(!actualKey.equals(decodeKey)) {
                     Logger.error(this, "Splitfile check block "+i+" does not encode to expected key for "+this+" for "+parent);

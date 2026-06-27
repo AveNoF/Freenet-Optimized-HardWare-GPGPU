@@ -1,6 +1,7 @@
 package freenet.store.caching;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -34,7 +35,15 @@ public class CachingFreenetStore<T extends StorableBlock> extends ProxyFreenetSt
 	 */
 	private AtomicBoolean closeCalled = new AtomicBoolean(false);
 
+	/** Write-back buffer: blocks that have been put() but not yet flushed to the underlying store. */
 	private final LRUMap<ByteArrayWrapper, Block<T>> blocksByRoutingKey;
+	/** Read-through cache: clean blocks that were fetched from the underlying store and are kept in
+	 * memory to avoid repeated random disk I/O. These are NEVER written back (they are already on
+	 * disk); they are only evicted (LRU). Entries here have {@link Block#block} set and
+	 * {@link Block#data}/{@link Block#header} null. */
+	private final LRUMap<ByteArrayWrapper, Block<T>> readCache;
+	/** Bytes currently held by this instance's read-through cache (== readCache.size()*sizeBlock). */
+	private long readCacheBytes;
 	private final StoreCallback<T> callback;
 	private final boolean collisionPossible;
 	private final ReadWriteLock configLock = new ReentrantReadWriteLock();
@@ -56,6 +65,7 @@ public class CachingFreenetStore<T extends StorableBlock> extends ProxyFreenetSt
 		this.callback = callback;
 		SemiOrderedShutdownHook shutdownHook = SemiOrderedShutdownHook.get();
 		this.blocksByRoutingKey = LRUMap.createSafeMap(ByteArrayWrapper.FAST_COMPARATOR);
+		this.readCache = LRUMap.createSafeMap(ByteArrayWrapper.FAST_COMPARATOR);
 		this.collisionPossible = callback.collisionPossible();
 		this.shuttingDown = false;
 		this.tracker = tracker;
@@ -77,24 +87,84 @@ public class CachingFreenetStore<T extends StorableBlock> extends ProxyFreenetSt
 			throws IOException {
 		ByteArrayWrapper key = new ByteArrayWrapper(routingKey);
 		
-		Block<T> block = null;
+		Block<T> writeBack = null;
+		Block<T> cached = null;
 		
 		configLock.readLock().lock();
 		try {
-			block = blocksByRoutingKey.get(key);
+			writeBack = blocksByRoutingKey.get(key);
+			if(writeBack == null)
+				cached = readCache.get(key);
 		} finally {
 			configLock.readLock().unlock();
 		}
 		
-		if(block != null) {
+		// Pending write-back block: reconstruct exactly as before (preserves old behaviour).
+		if(writeBack != null) {
 			try {
-				return this.callback.construct(block.data, block.header, routingKey, block.block.getFullKey(), canReadClientCache, canReadSlashdotCache, meta, null);
+				return this.callback.construct(writeBack.data, writeBack.header, routingKey, writeBack.block.getFullKey(), canReadClientCache, canReadSlashdotCache, meta, null);
 			} catch (KeyVerifyException e) {
 				Logger.error(this, "Error in fetching for CachingFreenetStore: "+e, e);
 			}
 		}
 		
-		return backDatastore.fetch(routingKey, fullKey, dontPromote, canReadClientCache, canReadSlashdotCache, ignoreOldBlocks, meta);	
+		// Read-through cache hit. For stores where the same routing key can map to different blocks
+		// (SSK), only serve from cache if the full key matches, otherwise we might return the wrong
+		// block.
+		if(cached != null && cached.block != null) {
+			boolean safe = !collisionPossible ||
+				(fullKey != null && Arrays.equals(fullKey, cached.block.getFullKey()));
+			if(safe) {
+				if(meta != null && cached.isOldBlock) meta.setOldBlock();
+				if(!dontPromote) {
+					configLock.writeLock().lock();
+					try {
+						// Re-check: the entry may have been evicted in the meantime.
+						if(readCache.get(key) == cached)
+							readCache.push(key, cached);
+					} finally {
+						configLock.writeLock().unlock();
+					}
+				}
+				return cached.block;
+			}
+		}
+		
+		// Miss: hit the underlying store, then cache the result for next time.
+		T result = backDatastore.fetch(routingKey, fullKey, dontPromote, canReadClientCache, canReadSlashdotCache, ignoreOldBlocks, meta);
+		if(result != null && !dontPromote)
+			putReadCache(key, result, meta != null && meta.isOldBlock());
+		return result;
+	}
+
+	/** Add a clean (already-on-disk) block to the read-through cache, evicting least-recently-used
+	 * entries if we are over the shared read-cache budget. */
+	private void putReadCache(ByteArrayWrapper key, T result, boolean isOldBlock) {
+		if(tracker.getReadCacheLimit() <= 0) return; // Read-through caching disabled.
+		Block<T> entry = new Block<T>();
+		entry.block = result;
+		entry.isOldBlock = isOldBlock;
+		// data/header intentionally left null: this marks it as a read-through (clean) entry.
+		configLock.writeLock().lock();
+		try {
+			if(shuttingDown) return;
+			// Don't shadow a pending write-back block.
+			if(blocksByRoutingKey.get(key) != null) return;
+			boolean wasPresent = readCache.get(key) != null;
+			readCache.push(key, entry);
+			if(!wasPresent) {
+				readCacheBytes += sizeBlock;
+				tracker.addReadCache(sizeBlock);
+			}
+			// Evict our own LRU entries while the global read cache is over budget.
+			while(tracker.getReadCacheSize() > tracker.getReadCacheLimit()) {
+				if(readCache.popValue() == null) break;
+				readCacheBytes -= sizeBlock;
+				tracker.removeReadCache(sizeBlock);
+			}
+		} finally {
+			configLock.writeLock().unlock();
+		}
 	}
 
 	@Override
@@ -131,6 +201,11 @@ public class CachingFreenetStore<T extends StorableBlock> extends ProxyFreenetSt
 		configLock.writeLock().lock();
 		
 		try {
+			// A newer version of this block is being stored; drop any stale read-through copy.
+			if(readCache.removeKey(key)) {
+				readCacheBytes -= sizeBlock;
+				tracker.removeReadCache(sizeBlock);
+			}
 			if(!shuttingDown) {
 				Block<T> previousBlock = blocksByRoutingKey.get(key);
 			
@@ -236,6 +311,11 @@ public class CachingFreenetStore<T extends StorableBlock> extends ProxyFreenetSt
 		configLock.writeLock().lock();
 		try {
 			shuttingDown = true;
+			// Drop the read-through cache and return its budget to the tracker.
+			while(readCache.popValue() != null) {
+				readCacheBytes -= sizeBlock;
+				tracker.removeReadCache(sizeBlock);
+			}
 			tracker.unregisterCachingFS(this);
 		} finally {
 			configLock.writeLock().unlock();

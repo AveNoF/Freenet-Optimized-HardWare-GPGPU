@@ -1,6 +1,7 @@
 package freenet.store.caching;
 
 import java.util.ArrayList;
+import java.util.concurrent.atomic.AtomicLong;
 
 import freenet.support.Logger;
 import freenet.support.Ticker;
@@ -27,6 +28,15 @@ public class CachingFreenetStoreTracker {
 	private final long period;
 	private final ArrayList<CachingFreenetStore<?>> cachingStores;
 	private final Ticker ticker;
+
+	/** Maximum number of bytes to keep in the (clean) read-through caches, shared across all
+	 * CachingFreenetStore instances. This is a SEPARATE budget from the write-back buffer above;
+	 * read-through entries are already on disk and are never flushed, only evicted (LRU). Defaults
+	 * to the same size as the write-back buffer; override with -Dfreenet.store.caching.readCacheSize
+	 * (bytes), or set to 0 to disable read-through caching. */
+	private final long maxReadCacheSize;
+	/** Current number of bytes held in read-through caches across all stores. */
+	private final AtomicLong readCacheSize = new AtomicLong();
 	
 	/** Is a write job queued for some point in the next period? There should only be one such job 
 	 * queued. However if we then run out of memory we will run a job immediately. */
@@ -48,6 +58,28 @@ public class CachingFreenetStoreTracker {
 		this.queuedJob = false;
 		this.cachingStores = new ArrayList<CachingFreenetStore<?>>();
 		this.ticker = ticker;
+		long rc = Long.getLong("freenet.store.caching.readCacheSize", maxSize);
+		this.maxReadCacheSize = rc < 0 ? 0 : rc;
+	}
+
+	/** Maximum total bytes allowed in read-through caches (0 = disabled). */
+	public long getReadCacheLimit() {
+		return maxReadCacheSize;
+	}
+
+	/** Current total bytes held in read-through caches. */
+	public long getReadCacheSize() {
+		return readCacheSize.get();
+	}
+
+	/** Account for a block added to a read-through cache. */
+	public void addReadCache(long sizeBlock) {
+		readCacheSize.addAndGet(sizeBlock);
+	}
+
+	/** Account for a block removed/evicted from a read-through cache. */
+	public void removeReadCache(long sizeBlock) {
+		readCacheSize.addAndGet(-sizeBlock);
 	}
 
 	/** register a CachingFreenetStore to be called when we get full or to flush all after a set period. */

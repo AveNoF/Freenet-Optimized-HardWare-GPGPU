@@ -156,5 +156,8 @@ public class JceLoader {
 		System.out.println("SunPKCS11-NSS: "+NSS);
 		System.out.println("SUN: "+SUN);
 		System.out.println("SunJCE: "+SunJCE);
+		// Also record in the log so acceleration choices are visible in normal operation.
+		Logger.normal(JceLoader.class, "Crypto providers: BouncyCastle="+BouncyCastle
+				+ ", SunPKCS11-NSS="+NSS + ", SUN="+SUN + ", SunJCE="+SunJCE);
 	}
 }
