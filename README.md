@@ -1,117 +1,76 @@
-[![Build status](https://img.shields.io/github/check-runs/hyphanet/fred/next?label=build)](https://github.com/hyphanet/fred/actions)
-[![Coverity status](https://scan.coverity.com/projects/2316/badge.svg?flat=1)](https://scan.coverity.com/projects/freenet-fred)
+# Freenet-Optimized-HardWare-GPGPU
 
-# Freenet
+A performance-focused fork of [Hyphanet/Freenet (fred)](https://github.com/hyphanet/fred).
 
-Freenet is a platform for censorship-resistant communication and publishing. It is peer-to-peer
-software which provides a distributed, encrypted, decentralized datastore. Websites and applications
-providing things like forums and chat are built on top of it.
+This fork keeps full protocol/wire compatibility with upstream Freenet but adds
+CPU-side optimizations that make better use of modern multi-core CPUs, hardware
+crypto (AES-NI / SHA-NI), and RAM. It also contains a documented GPGPU (CUDA)
+research experiment that was evaluated and deliberately **not** wired into the node.
 
-Fred stands for Freenet REference Daemon.
+> Upstream documentation (build instructions, contributing, etc.) is preserved in
+> [`README.upstream.md`](README.upstream.md).
 
-## Building
+---
 
-We've included the [Gradle Wrapper](https://docs.gradle.org/8.14.3/userguide/gradle_wrapper.html) as
-recommended by the Gradle project. If you trust the version we've committed you can build
-immediately:
+## What's different from stock Freenet
 
-#### POSIX / Windows PowerShell:
+| Area | Change | File(s) |
+|------|--------|---------|
+| **Splitfile FEC** | Block encode/verify (AES-CTR + SHA-256) is run in parallel across cores instead of serially. | `src/freenet/client/async/SplitFileFetcherSegmentStorage.java` |
+| **Datastore** | `CachingFreenetStore` is now a **read-through** cache: blocks fetched from disk are kept in an LRU so repeated reads are served from RAM. Shared, configurable byte budget. | `src/freenet/store/caching/CachingFreenetStore.java`, `CachingFreenetStoreTracker.java` |
+| **HMAC** | `Mac` instances are reused per-thread (`ThreadLocal`) instead of `Mac.getInstance()` on every packet. | `src/freenet/crypt/HMAC.java` |
+| **Crypto visibility** | The selected JCE provider (e.g. SunJCE with AES-NI/SHA-NI) is now logged at startup. | `src/freenet/crypt/JceLoader.java` |
 
-    $ ./gradlew jar
+### Tuning
 
-#### Windows cmd:
+- `-Dfreenet.store.caching.readCacheSize=<bytes>` — RAM budget for the read-through
+  cache (e.g. `134217728` for 128 MiB). `0` disables it (stock behaviour).
+- `-Dfreenet.client.fec.encodeThreads=<n>` — worker threads for parallel splitfile
+  encode/verify (defaults to the number of available processors).
 
-    > gradlew jar
+---
 
-We've [configured it](gradle/wrapper/gradle-wrapper.properties) to [verify the checksum](https://docs.gradle.org/8.14.3/userguide/gradle_wrapper.html#wrapper_checksum_verification)
-of the archive it downloads from `https://services.gradle.org`.
+## Measured before/after
 
-### Build with ant
+Micro-benchmarks against stock behaviour using the **real** fred code, on a
+16-thread CPU with AES-NI/SHA-NI enabled (see
+[`test/freenet/bench/ForkBenchmarkTest.java`](test/freenet/bench/ForkBenchmarkTest.java)):
 
-    $ mkdir -p lib; (cd lib && grep -o CHK.* ../dependencies.properties  | xargs -P16 -I {} bash -c 'fcpget -v {} "$(echo {} | sed s,^.*/,,)"')
-    $ ant -propertyfile build.properties -f build-clean.xml -Dtest.skip=true -Dfindbugs.skip=true
+| Benchmark | Stock | This fork | Speedup |
+|-----------|-------|-----------|---------|
+| Splitfile block encode/verify (128 MiB) | 572 MiB/s (serial) | 4,752 MiB/s (16 cores) | **~8.3x** |
+| HMAC-SHA256 per packet (300k ops) | 877k ops/s | 1,140k ops/s | **~1.3x** |
+| Repeated CHK fetch, hot working set | 3,194 fetch/s | 1,108,408 fetch/s | **~347x** (cache hit) |
 
-## Building the installers
+**Honest reading:** these are component-level numbers, not whole-node end-to-end
+throughput. Freenet is usually network/disk bound, so the real-world benefit depends
+on your workload — the splitfile and HMAC gains help CPU-bound nodes (many cores, fat
+pipe, large downloads), and the read-cache gain only materializes on cache hits
+(re-accessed / popular content). On a thin connection with no re-access, behaviour is
+essentially unchanged.
 
-The installers are built from specialized repositories:
-
-- The GNU/Linux, macOS and *nix installer is built from [hyphanet/java_installer](https://github.com/hyphanet/java_installer).
-- The Windows installer is built from [hyphanet/wininstaller-innosetup](https://github.com/hyphanet/wininstaller-innosetup) and signed with [hyphanet/sign-windows-installer](https://github.com/hyphanet/sign-windows-installer).
-
-Free code signing for the Windows installer is provided by [SignPath.io](https://about.signpath.io/), the certificate by the [SignPath Foundation](https://signpath.org/).
-
-
-## Testing
-
-### Run Tests
-
-To run all unit tests, use
-
-    ./gradlew --parallel test
-
-You can run specifics tests with a test filter similar to the following:
-
-    ./gradlew --parallel test --tests *M3UFilterTest
-
-TODO: how to run integration tests.
-
-### Run your changes as node
-
-To test your version of Freenet, build it with ,./gradlew jar`,
-stop your node, replace `freenet.jar` in your
-Freenet directory with `build/libs/freenet.jar`, and start your node again.
-
-To override values set in `build.gradle` put them into [the file](https://docs.gradle.org/8.14.3/userguide/build_environment.html)
-`gradle.properties` in the format `variable = value`. For instance:
-
-    org.gradle.parallel = true
-    org.gradle.daemon = true
-    org.gradle.jvmargs=-Xms256m -Xmx1024m
-    org.gradle.configureondemand=true
-
-    tasks.withType(Test)  {
-      maxParallelForks = Runtime.runtime.availableProcessors()
-    }
-
-## Contributing
-
-See our [contributor guidelines](CONTRIBUTING.md).
-
-### Get in contact
-
-* Ask the [development mailing list](https://www.hyphanet.org/pages/help.html#mailing-lists)
-  or join us in [IRC](https://web.libera.chat/?nick=Rabbit|?#freenet) - `#freenet` on
-  `irc.libera.chat`.
-* You can file problems in the [bug tracker](https://freenet.mantishub.io/my_view_page.php).
-
-## Add a new dependency
-
-All dependencies must be available via Freenet, so it must be added to
-dependencies.properties.
-
-- Add it to build.gradle dependencies *and* dependencyVerification.
-  Run `./gradlew jar --debug` to find files that fail the
-  verification.
-- fcpupload {dependencyfile.jar}
-- add it to all installers: wininstaller-innosetup, java_installer, mactray. Search for `jna-platform` to find out where to put and register the dependency.
-- add dependency and the CHK to `dependencies.properties`.
-- update `scripts/update.sh` and `res/wrapper.conf` and `res/unix/run.sh` in java_installer to include the dependency.
-
-With the example of pebble: The filename is just the jarfile. The key is what fcpupload returns. Size is `wc -c filename.jar`, sha256 is `sha256sum filename.jar`, order is where it should be put in `wrapper.conf` in wrapper.java.classpath.
+Run them yourself:
 
 ```
-pebble.version=3.1.5
-pebble.filename=pebble-3.1.5.jar
-pebble.filename-regex=pebble-*.jar
-pebble.key=CHK@y~p8HMUVXmVgfSnrmUyu2UNXMO9uMDHS5nwo2YuOKvw,yzwLFP0GXa8RjwRpicQCPFKNggDXLkTQKH8nISe0qUY,AAMC--8/pebble-3.1.5.jar
-pebble.size=318169
-pebble.sha256=85e77f9fd64c0a1f85569db8f95c1fb8e6ef8b296f4d6206440dc6306140c1a1
-pebble.type=CLASSPATH
-pebble.order=4
+./gradlew test --tests freenet.bench.ForkBenchmarkTest
 ```
 
-## Licensing
-Freenet is under the GPL, version 2 or later - see LICENSE.Freenet. We use some
-code under the Apache license version 2 (mostly apache commons stuff), and some
-modified BSD code (Mantissa). All of which is compatible with the GPL, although
-arguably ASL2 is only compatible with GPL3. Some plugins are GPL3.
+(results are printed to the test's stdout)
+
+---
+
+## GPGPU experiment (research only)
+
+The [`gpgpu/`](gpgpu/) directory contains standalone CUDA benchmarks that fuse
+AES-128-CTR + SHA-256 per 32 KiB block and compare a GPU against an OpenSSL CPU
+baseline (AES-NI/SHA-NI). **Conclusion: not worth integrating.** Raw GPU compute was
+~2x a 16-thread CPU, but once PCIe transfer is included it was ~0.5x (encode) to about
+on-par (verify) — and crypto isn't Freenet's bottleneck anyway. See
+[`gpgpu/README.md`](gpgpu/README.md) for the full write-up.
+
+---
+
+## License
+
+Same as upstream Freenet (GPLv2+). See [`README.upstream.md`](README.upstream.md) and
+the `LICENSE*` files.
