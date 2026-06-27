@@ -1,0 +1,4 @@
+# Compiled benchmark binaries (build locally with nvcc)
+blockcrypto_bench
+sha_bench
+*.o
